@@ -534,7 +534,8 @@ TEST_CASE("test split data size") {
   auto x = reshape(arange(24), {4, 6});
   auto parts = split(x, 2, 1);
   auto sl = slice(x, {0, 3}, {4, 6});
-  eval(parts, sl);
+  eval(parts);
+  eval(sl);
   CHECK_EQ(sl.data_size(), 21); // (4 - 1) * 6 + 3
   CHECK_EQ(parts[0].data_size(), 21);
   CHECK_EQ(parts[1].data_size(), 21);
