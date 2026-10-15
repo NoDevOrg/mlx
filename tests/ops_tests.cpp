@@ -527,6 +527,26 @@ TEST_CASE("test dynamic slice update") {
   CHECK(array_equal(out, expected).item<bool>());
 }
 
+TEST_CASE("test split data size") {
+  // data_size is the span of buffer an array covers; kernels use it to choose
+  // 32 vs 64-bit indexing. A strided split must report the same span as the
+  // equivalent slice, not its element count.
+  auto x = reshape(arange(24), {4, 6});
+  auto parts = split(x, 2, 1);
+  auto sl = slice(x, {0, 3}, {4, 6});
+  eval(parts, sl);
+  CHECK_EQ(sl.data_size(), 21); // (4 - 1) * 6 + 3
+  CHECK_EQ(parts[0].data_size(), 21);
+  CHECK_EQ(parts[1].data_size(), 21);
+  CHECK(array_equal(parts[1], sl).item<bool>());
+
+  // Contiguous splits keep their element count.
+  auto rows = split(x, 2, 0);
+  eval(rows);
+  CHECK_EQ(rows[0].data_size(), 12);
+  CHECK(rows[0].flags().row_contiguous);
+}
+
 TEST_CASE("test split") {
   array x = array(1);
   CHECK_THROWS(split(x, 0));

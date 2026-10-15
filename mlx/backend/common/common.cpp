@@ -173,6 +173,12 @@ void Split::eval(
     size_t data_size = 1;
     size_t f_stride = 1;
     size_t b_stride = 1;
+    // Like slice, data_size is the span of buffer the output covers (last
+    // offset - first offset + 1), not its element count. Kernels read it to pick
+    // 32 vs 64-bit indexing, so a strided split of a large buffer whose element
+    // count fits in 32 bits but whose span doesn't was indexed out of range.
+    int64_t low_idx = 0;
+    int64_t high_idx = 0;
     flags.row_contiguous = true;
     flags.col_contiguous = true;
     for (int i = 0, ri = shape.size() - 1; ri >= 0; i++, ri--) {
@@ -183,7 +189,14 @@ void Split::eval(
       if (strides[i] > 0) {
         data_size *= shape[i];
       }
+      auto delta = strides[i] * (static_cast<int64_t>(shape[i]) - 1);
+      if (delta > 0) {
+        high_idx += delta;
+      } else {
+        low_idx += delta;
+      }
     }
+    size_t span = static_cast<size_t>(high_idx - low_idx + 1);
 
     if (data_size == 1) {
       // Broadcasted scalar array is contiguous.
@@ -197,7 +210,7 @@ void Split::eval(
       flags.contiguous &= flags.row_contiguous || flags.col_contiguous;
     }
 
-    return std::pair<decltype(flags), size_t>{flags, data_size};
+    return std::pair<decltype(flags), size_t>{flags, span};
   };
 
   std::vector<int> indices(1, 0);
