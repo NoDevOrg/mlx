@@ -243,6 +243,10 @@ void Compiled::eval_gpu(
     // Build source code.
     cu::FusedKernelBuilder builder{
         g_jit_includes, lib_name(), inputs_, outputs_, tape_, is_constant_};
+    // Fused elementwise kernels must round like the separate ops they
+    // replace; jit_module compiles sources carrying this marker without FMA
+    // contraction (a bf16 x * y + z otherwise skips the product's rounding).
+    builder.os += "// mlx-jit: no-fmad\n";
     builder.os +=
         "namespace mlx::core::cu {\n\n"
         "namespace cg = cooperative_groups;\n\n";

@@ -343,6 +343,9 @@ void compile(
   for (const auto& include : include_path_args()) {
     args.push_back(include.c_str());
   }
+  if (source.find("// mlx-jit: no-fmad") != std::string::npos) {
+    args.push_back("--fmad=false");
+  }
 
   // Compile program.
   nvrtcResult compile_result =
