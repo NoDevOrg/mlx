@@ -136,7 +136,7 @@ std::optional<DnnGraph> build_conv_graph(
     return std::nullopt;
   }
   graph.deselect_numeric_notes({fe::NumericalNote_t::DOWN_CONVERT_INPUTS});
-  if (dtype == float32 && !env::enable_tf32()) {
+  if (dtype == float32 && !env::get_var("MLX_CONV_ENABLE_TF32", 1)) {
     graph.deselect_numeric_notes({fe::NumericalNote_t::TENSOR_CORE});
   }
   CHECK_CUDNN_ERROR(graph.build());
