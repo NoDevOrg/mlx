@@ -319,7 +319,10 @@ void CustomKernel::eval_gpu(
         return std::make_tuple(
             is_precompiled_, source_, std::vector{kernel_name});
       },
-      false);
+      // The module name hashes the full generated source (header, signature,
+      // template constants, body), so the on-disk cache can't serve a stale
+      // kernel. Without it every process recompiles every custom kernel.
+      true);
 
   // Make the arguments
   cu::KernelArgs args;
