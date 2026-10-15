@@ -432,6 +432,15 @@ JitModule::JitModule(
       }
     } else {
       compile(device, module_name, source_code, kernel_names, ptx, ptx_kernels);
+      // MLX_JIT_DUMP_DIR=<dir> writes each compiled module's source and its
+      // cubin (or PTX) there, for cuobjdump -sass.
+      if (auto dir = std::getenv("MLX_JIT_DUMP_DIR"); dir) {
+        auto base = std::filesystem::path(dir) / module_name.substr(0, 200);
+        bool elf = ptx.size() > 4 && ptx.compare(0, 4, "\x7f" "ELF") == 0;
+        std::ofstream(base.string() + (elf ? ".cubin" : ".ptx"), std::ios::binary)
+            .write(ptx.data(), ptx.size());
+        std::ofstream(base.string() + ".cu") << source_code;
+      }
     }
 
     // If requested save them in the file cache for the next launch
@@ -443,6 +452,26 @@ JitModule::JitModule(
 
   // Load the module
   load_module(module_name, ptx, ptx_kernels, module_, kernels_);
+
+  // MLX_JIT_KERNEL_INFO=1 prints each loaded kernel's registers, local
+  // (spill) memory and static shared memory, to check register pressure.
+  if (std::getenv("MLX_JIT_KERNEL_INFO")) {
+    for (const auto& [name, k] : kernels_) {
+      int regs = 0, local = 0, shared = 0;
+      cuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, std::get<0>(k));
+      cuFuncGetAttribute(
+          &local, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, std::get<0>(k));
+      cuFuncGetAttribute(
+          &shared, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, std::get<0>(k));
+      fmt::print(
+          stderr,
+          "mlx jit kernel {}: {} registers, {} B local, {} B static shared\n",
+          name,
+          regs,
+          local,
+          shared);
+    }
+  }
 }
 
 JitModule::~JitModule() {
