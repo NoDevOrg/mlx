@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <fmt/format.h>
 #include "mlx/backend/cuda/cuda.h"
@@ -149,6 +150,7 @@ void CublasMatmulBase::init_base(
       : (output_type == CUDA_R_32F || output_type == CUDA_C_32F) ? 4
                                                                    : 2;
   out_bytes_ = b_cols * a_rows * std::max<int32_t>(batch_count, 1) * out_elem;
+  flops_ = 2.0 * a_rows * a_cols * b_cols * std::max<int32_t>(batch_count, 1);
   std::tie(handle_, pref_) = get_cublas_handles(device);
   heuristic_.state = CUBLAS_STATUS_NOT_INITIALIZED;
 
@@ -206,11 +208,14 @@ void CublasMatmulBase::execute_matmul(
   if (heuristic_.state != CUBLAS_STATUS_SUCCESS) {
     // Plain f32 (no TF32): cuBLASLt's first candidate can be far from the
     // best (on GB10 it is ~6 TFLOPS where another algorithm reaches ~12.5),
-    // so time the candidates once per shape and keep the fastest. The result
+    // so time the candidates once per shape and keep a much faster one. The result
     // is the same f32 math in a different order. Off with
     // MLX_CUBLASLT_AUTOTUNE=0; "verbose" prints each choice.
     static const char* tune_env = std::getenv("MLX_CUBLASLT_AUTOTUNE");
+    // Only large matmuls (>= 200 GFLOP): small ones gain little, and their
+    // timings are noisy enough to make the choice unstable.
     bool tune = compute_type_ == CUBLAS_COMPUTE_32F && data_type_ == CUDA_R_32F &&
+        flops_ >= 2e11 &&
         !(tune_env && std::string(tune_env) == "0");
     std::string key = tune_key_ + (c ? "|c" : "") + (has_bias_ ? "|bias" : "");
     static std::unordered_map<std::string, cublasLtMatmulHeuristicResult_t>
@@ -323,8 +328,7 @@ cublasLtMatmulHeuristicResult_t CublasMatmulBase::autotune(
         r.workspaceSize,
         stream);
   };
-  float best_ms = 0, first_ms = 0;
-  int best = 0;
+  std::vector<float> times(count, 0);
   for (int i = 0; i < count; ++i) {
     if (results[i].state != CUBLAS_STATUS_SUCCESS ||
         run(results[i]) != CUBLAS_STATUS_SUCCESS) {
@@ -338,12 +342,7 @@ cublasLtMatmulHeuristicResult_t CublasMatmulBase::autotune(
     cudaEventSynchronize(e1);
     float ms = 0;
     cudaEventElapsedTime(&ms, e0, e1);
-    if (i == 0) {
-      first_ms = best_ms = ms;
-    } else if (ms < best_ms) {
-      best_ms = ms;
-      best = i;
-    }
+    times[i] = ms;
   }
   cudaStreamSynchronize(stream);
   cudaEventDestroy(e0);
@@ -353,10 +352,16 @@ cublasLtMatmulHeuristicResult_t CublasMatmulBase::autotune(
     cudaFree(ws);
   }
   cudaStreamDestroy(stream);
-  // Keep the default unless the winner is clearly faster, so near-ties can't
-  // flip the algorithm (and the rounding) from one run to the next.
-  return (first_ms > 0 && best_ms < 0.9f * first_ms) ? results[best]
-                                                       : results[0];
+  // The first candidate, in cuBLASLt's own order, that is at least 1.5x
+  // faster than the default; else the default. Not simply the fastest: when
+  // two candidates are both fast and close, timing noise picked a different
+  // one from run to run, which changed the rounding and the render.
+  for (int i = 1; i < count; ++i) {
+    if (times[0] > 0 && times[i] > 0 && times[i] * 1.5f < times[0]) {
+      return results[i];
+    }
+  }
+  return results[0];
 }
 
 void CublasMatmulBase::set_bias(

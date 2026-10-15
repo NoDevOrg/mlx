@@ -74,6 +74,7 @@ class CublasMatmulBase {
   cudaDataType_t data_type_{CUDA_R_32F};
   std::string tune_key_;
   size_t out_bytes_{0};
+  double flops_{0};
   bool has_bias_{false};
 
   void init_base(
