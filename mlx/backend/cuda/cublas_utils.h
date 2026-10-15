@@ -1,6 +1,8 @@
 // Copyright © 2025 Apple Inc.
 #pragma once
 
+#include <string>
+
 #include "mlx/array.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/dtype_utils.h"
@@ -67,6 +69,12 @@ class CublasMatmulBase {
   cublasLtMatrixLayout_t c_desc_{nullptr};
   cublasLtMatrixLayout_t out_desc_{nullptr};
   cublasLtMatmulHeuristicResult_t heuristic_;
+  // For the f32 algorithm autotune (see execute_matmul).
+  cublasComputeType_t compute_type_{CUBLAS_COMPUTE_32F};
+  cudaDataType_t data_type_{CUDA_R_32F};
+  std::string tune_key_;
+  size_t out_bytes_{0};
+  bool has_bias_{false};
 
   void init_base(
       cu::Device& device,
@@ -85,6 +93,15 @@ class CublasMatmulBase {
       int32_t batch_count,
       int64_t a_batch_stride,
       int64_t b_batch_stride);
+
+  cublasLtMatmulHeuristicResult_t autotune(
+      const void* a,
+      const void* b,
+      const void* c,
+      const void* alpha_ptr,
+      const void* beta_ptr,
+      const cublasLtMatmulHeuristicResult_t* results,
+      int count);
 
   void execute_matmul(
       cu::CommandEncoder& encoder,

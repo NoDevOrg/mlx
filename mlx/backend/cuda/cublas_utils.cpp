@@ -1,6 +1,12 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/cublas_utils.h"
+
+#include <cstdlib>
+#include <string>
+#include <unordered_map>
+
+#include <fmt/format.h>
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/utils.h"
@@ -120,6 +126,29 @@ void CublasMatmulBase::init_base(
   M_ = a_rows;
   N_ = b_cols;
   scale_type_ = scale_type;
+  compute_type_ = compute_type;
+  data_type_ = data_type;
+  tune_key_ = fmt::format(
+      "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+      static_cast<int>(compute_type),
+      static_cast<int>(data_type),
+      static_cast<int>(output_type),
+      a_transposed,
+      a_rows,
+      a_cols,
+      lda,
+      b_transposed,
+      b_rows,
+      b_cols,
+      ldb,
+      batch_count,
+      a_batch_stride,
+      b_batch_stride,
+      static_cast<int>(scale_type));
+  size_t out_elem = output_type == CUDA_R_64F ? 8
+      : (output_type == CUDA_R_32F || output_type == CUDA_C_32F) ? 4
+                                                                   : 2;
+  out_bytes_ = b_cols * a_rows * std::max<int32_t>(batch_count, 1) * out_elem;
   std::tie(handle_, pref_) = get_cublas_handles(device);
   heuristic_.state = CUBLAS_STATUS_NOT_INITIALIZED;
 
@@ -175,20 +204,53 @@ void CublasMatmulBase::execute_matmul(
     const void* alpha_ptr,
     const void* beta_ptr) {
   if (heuristic_.state != CUBLAS_STATUS_SUCCESS) {
-    int ret = 0;
-    CHECK_CUBLAS_ERROR(cublasLtMatmulAlgoGetHeuristic(
-        handle_,
-        matmul_desc_,
-        a_desc_,
-        b_desc_,
-        c ? c_desc_ : out_desc_,
-        out_desc_,
-        pref_,
-        1,
-        &heuristic_,
-        &ret));
-    if (ret == 0) {
-      throw std::runtime_error("Can not find algorithm for matmul.");
+    // Plain f32 (no TF32): cuBLASLt's first candidate can be far from the
+    // best (on GB10 it is ~6 TFLOPS where another algorithm reaches ~12.5),
+    // so time the candidates once per shape and keep the fastest. The result
+    // is the same f32 math in a different order. Off with
+    // MLX_CUBLASLT_AUTOTUNE=0; "verbose" prints each choice.
+    static const char* tune_env = std::getenv("MLX_CUBLASLT_AUTOTUNE");
+    bool tune = compute_type_ == CUBLAS_COMPUTE_32F && data_type_ == CUDA_R_32F &&
+        !(tune_env && std::string(tune_env) == "0");
+    std::string key = tune_key_ + (c ? "|c" : "") + (has_bias_ ? "|bias" : "");
+    static std::unordered_map<std::string, cublasLtMatmulHeuristicResult_t>
+        tuned;
+    if (tune && tuned.count(key)) {
+      heuristic_ = tuned[key];
+    } else {
+      constexpr int kCandidates = 8;
+      cublasLtMatmulHeuristicResult_t results[kCandidates];
+      int ret = 0;
+      CHECK_CUBLAS_ERROR(cublasLtMatmulAlgoGetHeuristic(
+          handle_,
+          matmul_desc_,
+          a_desc_,
+          b_desc_,
+          c ? c_desc_ : out_desc_,
+          out_desc_,
+          pref_,
+          tune ? kCandidates : 1,
+          results,
+          &ret));
+      if (ret == 0) {
+        throw std::runtime_error("Can not find algorithm for matmul.");
+      }
+      heuristic_ = results[0];
+      if (tune && ret > 1) {
+        heuristic_ = autotune(a, b, c, alpha_ptr, beta_ptr, results, ret);
+        if (tune_env && std::string(tune_env) == "verbose") {
+          int id0 = 0, id = 0;
+          size_t sz;
+          cublasLtMatmulAlgoConfigGetAttribute(
+              &results[0].algo, CUBLASLT_ALGO_CONFIG_ID, &id0, sizeof(id0), &sz);
+          cublasLtMatmulAlgoConfigGetAttribute(
+              &heuristic_.algo, CUBLASLT_ALGO_CONFIG_ID, &id, sizeof(id), &sz);
+          fmt::print(stderr, "mlx cublasLt f32 autotune {}: algo {} -> {}\n", key, id0, id);
+        }
+      }
+      if (tune) {
+        tuned[key] = heuristic_;
+      }
     }
   }
 
@@ -215,10 +277,93 @@ void CublasMatmulBase::execute_matmul(
       encoder.stream()));
 }
 
+cublasLtMatmulHeuristicResult_t CublasMatmulBase::autotune(
+    const void* a,
+    const void* b,
+    const void* c,
+    const void* alpha_ptr,
+    const void* beta_ptr,
+    const cublasLtMatmulHeuristicResult_t* results,
+    int count) {
+  // Runs on a private stream before this op's graph capture begins. Inputs
+  // are only read (their contents don't matter for timing); the output goes
+  // to scratch memory, since the real output buffer may still be in use by
+  // work that hasn't run yet.
+  cudaStream_t stream;
+  CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  size_t ws_bytes = 0;
+  for (int i = 0; i < count; ++i) {
+    ws_bytes = std::max(ws_bytes, results[i].workspaceSize);
+  }
+  void* scratch = nullptr;
+  void* ws = nullptr;
+  CHECK_CUDA_ERROR(cudaMalloc(&scratch, out_bytes_));
+  if (ws_bytes > 0) {
+    CHECK_CUDA_ERROR(cudaMalloc(&ws, ws_bytes));
+  }
+  cudaEvent_t e0, e1;
+  CHECK_CUDA_ERROR(cudaEventCreate(&e0));
+  CHECK_CUDA_ERROR(cudaEventCreate(&e1));
+  auto run = [&](const cublasLtMatmulHeuristicResult_t& r) {
+    return cublasLtMatmul(
+        handle_,
+        matmul_desc_,
+        alpha_ptr,
+        b,
+        a_desc_,
+        a,
+        b_desc_,
+        beta_ptr,
+        c ? c : scratch,
+        c ? c_desc_ : out_desc_,
+        scratch,
+        out_desc_,
+        &r.algo,
+        ws,
+        r.workspaceSize,
+        stream);
+  };
+  float best_ms = 0, first_ms = 0;
+  int best = 0;
+  for (int i = 0; i < count; ++i) {
+    if (results[i].state != CUBLAS_STATUS_SUCCESS ||
+        run(results[i]) != CUBLAS_STATUS_SUCCESS) {
+      continue;
+    }
+    cudaEventRecord(e0, stream);
+    for (int r = 0; r < 3; ++r) {
+      run(results[i]);
+    }
+    cudaEventRecord(e1, stream);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    if (i == 0) {
+      first_ms = best_ms = ms;
+    } else if (ms < best_ms) {
+      best_ms = ms;
+      best = i;
+    }
+  }
+  cudaStreamSynchronize(stream);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  cudaFree(scratch);
+  if (ws) {
+    cudaFree(ws);
+  }
+  cudaStreamDestroy(stream);
+  // Keep the default unless the winner is clearly faster, so near-ties can't
+  // flip the algorithm (and the rounding) from one run to the next.
+  return (first_ms > 0 && best_ms < 0.9f * first_ms) ? results[best]
+                                                       : results[0];
+}
+
 void CublasMatmulBase::set_bias(
     cu::CommandEncoder& encoder,
     const array& bias) {
   encoder.set_input_array(bias);
+  has_bias_ = true;
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(
       matmul_desc_,
